@@ -2,3 +2,5 @@ streamlit
 yfinance
 pandas
 plotly
+curl_cffi
+numpy
