@@ -3,7 +3,8 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+from datetime import datetime
+import time
 
 # ----------------------------
 # 페이지 기본 설정
@@ -18,7 +19,21 @@ st.title("📈 글로벌 주요 주식 대시보드")
 st.caption("Yahoo Finance (yfinance) 데이터를 기반으로 제작되었습니다.")
 
 # ----------------------------
-# 주요 종목 리스트 (원하는 대로 수정 가능)
+# Yahoo 차단 회피용 세션 (curl_cffi로 브라우저처럼 위장)
+# ----------------------------
+@st.cache_resource
+def get_session():
+    try:
+        from curl_cffi import requests as cffi_requests
+        session = cffi_requests.Session(impersonate="chrome")
+        return session
+    except Exception:
+        return None
+
+SESSION = get_session()
+
+# ----------------------------
+# 주요 종목 리스트
 # ----------------------------
 TICKERS = {
     "🇺🇸 Apple": "AAPL",
@@ -70,6 +85,9 @@ show_volume = st.sidebar.checkbox("거래량 표시", value=True)
 show_ma = st.sidebar.checkbox("이동평균선 표시 (20/60일)", value=True)
 
 st.sidebar.markdown("---")
+if st.sidebar.button("🔄 캐시 초기화 후 새로고침"):
+    st.cache_data.clear()
+    st.rerun()
 st.sidebar.caption("데이터 출처: Yahoo Finance")
 
 if not selected_names:
@@ -77,22 +95,23 @@ if not selected_names:
     st.stop()
 
 # ----------------------------
-# 데이터 불러오기 (캐시 처리로 속도 개선)
+# 데이터 불러오기 (캐시 30분 + 재시도 로직 + 에러 방지)
 # ----------------------------
-@st.cache_data(ttl=600)
-def load_data(ticker, period, interval):
-    df = yf.Ticker(ticker).history(period=period, interval=interval)
-    return df
-
-@st.cache_data(ttl=600)
-def load_info(ticker):
-    try:
-        return yf.Ticker(ticker).fast_info
-    except Exception:
-        return None
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_data(ticker, period, interval, _retries=3):
+    for attempt in range(_retries):
+        try:
+            t = yf.Ticker(ticker, session=SESSION)
+            df = t.history(period=period, interval=interval)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+        time.sleep(2 * (attempt + 1))  # 점점 대기시간을 늘려가며 재시도
+    return pd.DataFrame()  # 끝내 실패하면 빈 DataFrame 반환
 
 # ----------------------------
-# 상단 요약 카드 (현재가 / 등락률)
+# 상단 요약 카드
 # ----------------------------
 st.subheader("📊 실시간 요약")
 cols = st.columns(len(selected_names))
@@ -101,7 +120,7 @@ for i, name in enumerate(selected_names):
     ticker = TICKERS[name]
     df = load_data(ticker, "5d", "1d")
     if df.empty or len(df) < 2:
-        cols[i].metric(name, "데이터 없음")
+        cols[i].metric(name, "일시적 오류")
         continue
     last_price = df["Close"].iloc[-1]
     prev_price = df["Close"].iloc[-2]
@@ -116,17 +135,21 @@ for i, name in enumerate(selected_names):
 st.markdown("---")
 
 # ----------------------------
-# 개별 종목 차트 (캔들스틱 + 거래량)
+# 개별 종목 차트
 # ----------------------------
 st.subheader("📈 종목별 차트")
+
+any_success = False
 
 for name in selected_names:
     ticker = TICKERS[name]
     df = load_data(ticker, period, interval)
 
     if df.empty:
-        st.error(f"{name} 데이터를 불러올 수 없습니다.")
+        st.warning(f"⚠️ {name} 데이터를 지금은 불러올 수 없습니다 (Yahoo Finance 요청 제한). 잠시 후 '캐시 초기화 후 새로고침'을 눌러보세요.")
         continue
+
+    any_success = True
 
     with st.expander(f"{name} ({ticker})", expanded=True):
         rows = 2 if show_volume else 1
@@ -139,7 +162,6 @@ for name in selected_names:
             row_heights=row_heights
         )
 
-        # 캔들스틱
         fig.add_trace(
             go.Candlestick(
                 x=df.index,
@@ -154,7 +176,6 @@ for name in selected_names:
             row=1, col=1
         )
 
-        # 이동평균선
         if show_ma:
             df["MA20"] = df["Close"].rolling(window=20).mean()
             df["MA60"] = df["Close"].rolling(window=60).mean()
@@ -170,7 +191,6 @@ for name in selected_names:
                 row=1, col=1
             )
 
-        # 거래량
         if show_volume:
             colors = ["red" if row["Close"] >= row["Open"] else "blue"
                       for _, row in df.iterrows()]
@@ -193,30 +213,31 @@ for name in selected_names:
 st.markdown("---")
 
 # ----------------------------
-# 비교 차트 (수익률 정규화 비교)
+# 비교 차트
 # ----------------------------
-st.subheader("🔀 종목 간 수익률 비교 (기준일 대비 %)")
+if any_success:
+    st.subheader("🔀 종목 간 수익률 비교 (기준일 대비 %)")
 
-compare_fig = go.Figure()
+    compare_fig = go.Figure()
 
-for name in selected_names:
-    ticker = TICKERS[name]
-    df = load_data(ticker, period, interval)
-    if df.empty:
-        continue
-    normalized = (df["Close"] / df["Close"].iloc[0] - 1) * 100
-    compare_fig.add_trace(
-        go.Scatter(x=df.index, y=normalized, mode="lines", name=name)
+    for name in selected_names:
+        ticker = TICKERS[name]
+        df = load_data(ticker, period, interval)
+        if df.empty:
+            continue
+        normalized = (df["Close"] / df["Close"].iloc[0] - 1) * 100
+        compare_fig.add_trace(
+            go.Scatter(x=df.index, y=normalized, mode="lines", name=name)
+        )
+
+    compare_fig.update_layout(
+        height=500,
+        yaxis_title="수익률 (%)",
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=10, r=10, t=30, b=10),
     )
 
-compare_fig.update_layout(
-    height=500,
-    yaxis_title="수익률 (%)",
-    template="plotly_white",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    margin=dict(l=10, r=10, t=30, b=10),
-)
-
-st.plotly_chart(compare_fig, use_container_width=True)
+    st.plotly_chart(compare_fig, use_container_width=True)
 
 st.caption(f"마지막 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
